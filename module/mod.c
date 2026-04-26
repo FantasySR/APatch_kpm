@@ -1,16 +1,16 @@
 #include <linux/module.h>
 #include <linux/kernel.h>
-#include <kpm.h>
+#include <accctl.h>
 
 static int my_init(void)
 {
-    printk(KERN_INFO "Hello KPM from module!\n");
+    printk(KERN_INFO "Hello from my KPM module!\n");
     return 0;
 }
 
 static void my_exit(void)
 {
-    printk(KERN_INFO "Goodbye KPM from module!\n");
+    printk(KERN_INFO "Goodbye from my KPM module!\n");
 }
 
 KPM_INIT(my_init);
