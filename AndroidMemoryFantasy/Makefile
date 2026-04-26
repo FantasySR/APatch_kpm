@@ -31,27 +31,6 @@ INCLUDE_DIRS := . include patch/include linux/include linux/arch/arm64/include l
 
 INCLUDE_FLAGS := $(foreach dir,$(INCLUDE_DIRS),-I$(KP_DIR)/kernel/$(dir))
 
-# ===== 修改1: 指定你的源文件编译产生的 .o 文件 =====
 objs := AMF.o
 
-# ===== 修改2: 普通编译目标，文件名改为 AMF_xxx.kpm =====
-all: AMF_$(MYKPM_VERSION).kpm
-
-debug: CFLAGS += -DCONFIG_DEBUG
-debug: HR_VER := _d
-debug: AMF_$(MYKPM_VERSION)_debug.kpm
-
-# ===== 修改3: 链接规则中的目标名同步修改 =====
-AMF_$(MYKPM_VERSION).kpm: ${objs}
-        ${CC} -r -o $@ $^
-
-AMF_$(MYKPM_VERSION)_debug.kpm: ${objs}
-        ${CC} -r -o $@ $^
-
-%.o: %.c
-        ${CC} $(CFLAGS) $(INCLUDE_FLAGS) -c -o $@ $<
-
-.PHONY: clean
-clean:
-        rm -rf *.kpm
-        find . -name "*.o" | xargs rm -f
+all: AMF_
