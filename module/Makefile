@@ -1,4 +1,4 @@
-NAME = module
+NAME = mod
 VERSION = 1.0
 
 # 使用 GitHub Actions 环境中 NDK 的完整 clang 路径
