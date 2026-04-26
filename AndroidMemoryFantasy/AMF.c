@@ -14,21 +14,16 @@
 #include <linux/string.h>
 #include <uapi/linux/limits.h>
 
-#include "hr_utils.h"
-
-// 修改模块元数据
 KPM_NAME("AndroidMemoryFantasy");
 KPM_VERSION("1.0");
 KPM_LICENSE("GPL");
 
-// 精简的初始化函数
 static long my_init(const char *args, const char *event, void __user *reserved)
 {
     printk(KERN_INFO "AndroidMemoryFantasy: loaded\n");
     return 0;
 }
 
-// 精简的退出函数
 static long my_exit(void __user *reserved)
 {
     printk(KERN_INFO "AndroidMemoryFantasy: unloaded\n");
