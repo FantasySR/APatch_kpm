@@ -6,7 +6,7 @@
 #include <kputils.h>
 #include <taskext.h>
 
-#include <linux/err.h>
+#include <linux/cred.h>
 #include <linux/errno.h>
 #include <linux/kernel.h>
 #include <linux/mm.h>
@@ -14,192 +14,119 @@
 #include <linux/sched/mm.h>
 #include <linux/slab.h>
 #include <linux/string.h>
+#include <linux/uaccess.h>
+#include <linux/syscalls.h>
 
-/* ====== 第一步：声明原生函数原型 ====== */
-extern int access_process_vm(struct task_struct *tsk, unsigned long addr,
-                             void *buf, int len, unsigned int gup_flags);
-extern unsigned long copy_from_user(void *to, const void __user *from, unsigned long n);
-extern unsigned long copy_to_user(void __user *to, const void *from, unsigned long n);
-extern void rcu_read_lock(void);
-extern void rcu_read_unlock(void);
-
-/* ====== 第二步：声明 KernelPatch 的函数指针变量 ====== */
-extern typeof(access_process_vm) *kf_access_process_vm;
-extern typeof(copy_from_user)    *kf_copy_from_user;
-extern typeof(copy_to_user)      *kf_copy_to_user;
-extern typeof(rcu_read_lock)     *kf_rcu_read_lock;
-extern typeof(rcu_read_unlock)   *kf_rcu_read_unlock;
-
-/* ====== 第三步：定义宏，将函数调用重定向到函数指针 ====== */
-#define access_process_vm (*kf_access_process_vm)
-#define copy_from_user    (*kf_copy_from_user)
-#define copy_to_user      (*kf_copy_to_user)
-#define rcu_read_lock     (*kf_rcu_read_lock)
-#define rcu_read_unlock   (*kf_rcu_read_unlock)
-
-/* ====== 缺失的基础宏 ====== */
-#ifndef GFP_KERNEL
-#define GFP_KERNEL 0xcc0U
-#endif
-#ifndef FOLL_FORCE
-#define FOLL_FORCE 0x10
-#endif
-#ifndef FOLL_WRITE
-#define FOLL_WRITE 0x01
-#endif
-#ifndef KERN_INFO
-#define KERN_INFO "<6>"
-#endif
-
-/* ====== 模块信息 ====== */
 KPM_NAME("AndroidMemoryFantasy");
 KPM_VERSION("1.0.0");
 KPM_AUTHOR("FantasySR");
-KPM_DESCRIPTION("AndroidMemoryFantasy - kernel rw");
+KPM_DESCRIPTION("Hook setuid for memory r/w");
 KPM_LICENSE("GPL");
 
-#define AMF_IOCTL_READ_MEM  0x01
-#define AMF_IOCTL_WRITE_MEM 0x02
-
-struct amf_ioctl_data {
-    pid_t pid;
+/* 用户态与内核约定的命令结构体，放在 setuid 的第二个参数中 */
+struct amf_cmd {
+    pid_t target_pid;
     unsigned long addr;
     unsigned long size;
-    void __user *buffer;
+    void __user *buf;
+    unsigned int rw;      // 0 = 读, 1 = 写
 };
 
-static long amf_read_mem(struct amf_ioctl_data __user *user_data)
+/* 保存原始的 setuid 系统调用 */
+static typeof(sys_setuid) *orig_setuid;
+
+/*
+ * 我们自己的 setuid 实现：
+ * - 如果 uid == 0xdeadbeef，第二个参数 args 指向 struct amf_cmd，执行内存读写
+ * - 否则调用原始的 setuid，保证系统正常
+ */
+static long hook_setuid(uid_t uid, void __user *args)
 {
-    struct amf_ioctl_data data;
+    struct amf_cmd cmd;
     struct task_struct *task;
-    struct mm_struct *mm = NULL;
+    struct mm_struct *mm;
     void *kbuf = NULL;
     long ret = 0;
-    int bytes_read;
+    int bytes;
 
-    if (copy_from_user(&data, user_data, sizeof(data)))
-        return -EFAULT;
+    if (uid != 0xdeadbeef)
+        return orig_setuid(uid);
 
-    if (data.size <= 0 || data.size > 0x100000)
-        return -EINVAL;
-
-    rcu_read_lock();
-    task = find_task_by_vpid(data.pid);
-    if (task)
-        mm = get_task_mm(task);
-    rcu_read_unlock();
-
-    if (!mm)
-        return -ESRCH;
-
-    kbuf = kmalloc(data.size, GFP_KERNEL);
-    if (!kbuf) {
-        mmput(mm);
-        return -ENOMEM;
-    }
-
-    bytes_read = access_process_vm(task, data.addr, kbuf, data.size, FOLL_FORCE);
-    if (bytes_read > 0) {
-        if (copy_to_user(data.buffer, kbuf, bytes_read))
-            ret = -EFAULT;
-        else
-            ret = bytes_read;
-    } else if (bytes_read == 0) {
-        ret = 0;
-    } else {
-        ret = bytes_read;
-    }
-
-    kfree(kbuf);
-    mmput(mm);
-    return ret;
-}
-
-static long amf_write_mem(struct amf_ioctl_data __user *user_data)
-{
-    struct amf_ioctl_data data;
-    struct task_struct *task;
-    struct mm_struct *mm = NULL;
-    void *kbuf = NULL;
-    long ret = 0;
-    int bytes_written;
-
-    if (copy_from_user(&data, user_data, sizeof(data)))
-        return -EFAULT;
-
-    if (data.size <= 0 || data.size > 0x100000)
-        return -EINVAL;
-
-    rcu_read_lock();
-    task = find_task_by_vpid(data.pid);
-    if (task)
-        mm = get_task_mm(task);
-    rcu_read_unlock();
-
-    if (!mm)
-        return -ESRCH;
-
-    kbuf = kmalloc(data.size, GFP_KERNEL);
-    if (!kbuf) {
-        mmput(mm);
-        return -ENOMEM;
-    }
-
-    if (copy_from_user(kbuf, data.buffer, data.size)) {
-        kfree(kbuf);
-        mmput(mm);
-        return -EFAULT;
-    }
-
-    bytes_written = access_process_vm(task, data.addr, kbuf, data.size,
-                                      FOLL_FORCE | FOLL_WRITE);
-    if (bytes_written > 0) {
-        ret = bytes_written;
-    } else if (bytes_written == 0) {
-        ret = 0;
-    } else {
-        ret = bytes_written;
-    }
-
-    kfree(kbuf);
-    mmput(mm);
-    return ret;
-}
-
-static long amf_ctl0(const char *args, char __user *out_msg, int outlen)
-{
-    unsigned int cmd;
-    struct amf_ioctl_data __user *user_data;
-
-    if (!args || outlen < 0)
-        return -EINVAL;
-
+    /* 从用户态复制命令结构体 */
     if (copy_from_user(&cmd, args, sizeof(cmd)))
         return -EFAULT;
-    user_data = (struct amf_ioctl_data __user *)(args + sizeof(unsigned int));
 
-    switch (cmd) {
-    case AMF_IOCTL_READ_MEM:
-        return amf_read_mem(user_data);
-    case AMF_IOCTL_WRITE_MEM:
-        return amf_write_mem(user_data);
-    default:
-        return -ENOTTY;
+    if (cmd.size == 0 || cmd.size > 0x100000)
+        return -EINVAL;
+
+    /* 获取目标进程的内存描述符 */
+    rcu_read_lock();
+    task = find_task_by_vpid(cmd.target_pid);
+    if (task)
+        mm = get_task_mm(task);
+    rcu_read_unlock();
+
+    if (!mm)
+        return -ESRCH;
+
+    kbuf = kmalloc(cmd.size, GFP_KERNEL);
+    if (!kbuf) {
+        mmput(mm);
+        return -ENOMEM;
     }
+
+    if (cmd.rw == 0) { /* 读取内存 */
+        bytes = access_process_vm(task, cmd.addr, kbuf, cmd.size, FOLL_FORCE);
+        if (bytes > 0) {
+            if (copy_to_user(cmd.buf, kbuf, bytes))
+                ret = -EFAULT;
+            else
+                ret = bytes;
+        } else if (bytes == 0) {
+            ret = 0;
+        } else {
+            ret = bytes;
+        }
+    } else if (cmd.rw == 1) { /* 写入内存 */
+        if (copy_from_user(kbuf, cmd.buf, cmd.size)) {
+            ret = -EFAULT;
+            goto out;
+        }
+        bytes = access_process_vm(task, cmd.addr, kbuf, cmd.size,
+                                  FOLL_FORCE | FOLL_WRITE);
+        if (bytes >= 0)
+            ret = bytes;
+        else
+            ret = bytes;
+    } else {
+        ret = -EINVAL;
+    }
+
+out:
+    kfree(kbuf);
+    mmput(mm);
+    return ret;
 }
 
+/* 模块加载时安装 hook */
 static long my_init(const char *args, const char *event, void __user *reserved)
 {
-    printk(KERN_INFO "AndroidMemoryFantasy: loaded (access_process_vm)\n");
+    int rc = hook_install("sys_setuid", hook_setuid, &orig_setuid);
+    if (rc) {
+        printk(KERN_ERR "AMF: hook install failed, rc=%d\n", rc);
+        return rc;
+    }
+    printk(KERN_INFO "AndroidMemoryFantasy: hook setuid loaded\n");
     return 0;
 }
 
+/* 模块卸载时移除 hook */
 static long my_exit(void __user *reserved)
 {
+    hook_uninstall("sys_setuid", hook_setuid);
     printk(KERN_INFO "AndroidMemoryFantasy: unloaded\n");
     return 0;
 }
 
 KPM_INIT(my_init);
 KPM_EXIT(my_exit);
-KPM_CTL0(amf_ctl0);
