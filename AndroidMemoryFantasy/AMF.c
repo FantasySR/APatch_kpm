@@ -1,42 +1,54 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
+/*
+ * AndroidMemoryFantasy - minimal KPM module based on hosts_redirect
+ */
 #include <accctl.h>
+#include <compiler.h>
+#include <hook.h>
+#include <kpmodule.h>
+#include <kputils.h>
+#include <taskext.h>
+#include <linux/cred.h>
+#include <linux/err.h>
+#include <linux/fs.h>
 #include <linux/kernel.h>
+#include <linux/printk.h>
+#include <linux/spinlock.h>
+#include <linux/string.h>
+#include <uapi/linux/limits.h>
 
+// 模块元数据
 KPM_NAME("AndroidMemoryFantasy");
 KPM_VERSION("1.0");
 KPM_LICENSE("GPL");
 KPM_AUTHOR("YourName");
-KPM_DESCRIPTION("Test module with control interface (no extra headers)");
+KPM_DESCRIPTION("Minimal memory r/w module");
 
-// 控制函数：当用户态调用 kp module control 时触发
-static long my_ctl(const char *args, char __user *out_msg, int outlen)
+// 可选的控制接口（用于接收用户态命令）
+static long amf_ctl(const char *args, char __user *out_msg, int outlen)
 {
-    if (args) {
-        printk(KERN_INFO "AMF: received control args: %s\n", args);
-    } else {
-        printk(KERN_INFO "AMF: received control with null args\n");
-    }
-
-    // 可选：向用户态返回信息（复制到 out_msg 缓冲区）
-    if (out_msg && outlen > 0) {
-        const char *reply = "OK";
-        // copy_to_user 需要 linux/uaccess.h，但为了简化，先不实现
-        // 如果你需要回复，我们后续再加头文件，不影响基本功能
-    }
+    if (args)
+        printk(KERN_INFO "AMF: ctl args: %s\n", args);
+    else
+        printk(KERN_INFO "AMF: ctl called\n");
+    // 如果需要回复，可以复制数据到 out_msg，但为了简单暂时不实现
     return 0;
 }
 
-static long my_init(const char *args, const char *event, void __user *reserved)
+// 模块加载
+static long amf_init(const char *args, const char *event, void __user *reserved)
 {
-    printk(KERN_INFO "AMF: module loaded\n");
+    printk(KERN_INFO "AndroidMemoryFantasy: loaded\n");
     return 0;
 }
 
-static long my_exit(void __user *reserved)
+// 模块卸载
+static long amf_exit(void __user *reserved)
 {
-    printk(KERN_INFO "AMF: module unloaded\n");
+    printk(KERN_INFO "AndroidMemoryFantasy: unloaded\n");
     return 0;
 }
 
-KPM_INIT(my_init);
-KPM_CTL0(my_ctl);   // 注册控制接口
-KPM_EXIT(my_exit);
+KPM_INIT(amf_init);
+KPM_CTL0(amf_ctl);   // 注册控制接口（可移除如果不需要）
+KPM_EXIT(amf_exit);
