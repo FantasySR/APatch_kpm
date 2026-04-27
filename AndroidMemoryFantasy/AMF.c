@@ -10,16 +10,15 @@
 #include <linux/errno.h>
 #include <linux/gfp.h>
 #include <linux/kernel.h>
-#include <linux/mm.h>            /* 页表宏已经在里面了，不再需要 asm/pgtable.h */
+#include <linux/mm.h>
 #include <linux/sched.h>
 #include <linux/sched/mm.h>
 #include <linux/slab.h>
-#include <linux/uaccess.h>       /* get_user, put_user */
 
 KPM_NAME("AndroidMemoryFantasy");
 KPM_VERSION("1.0.0");
 KPM_AUTHOR("FantasySR");
-KPM_DESCRIPTION("AndroidMemoryFantasy - final page walk r/w");
+KPM_DESCRIPTION("AndroidMemoryFantasy - kernel rw via access_process_vm");
 KPM_LICENSE("GPL");
 
 #define AMF_IOCTL_READ_MEM  0x01
@@ -32,133 +31,149 @@ struct amf_ioctl_data {
     void __user *buffer;
 };
 
-/* 手动翻译虚拟地址 → 物理页面 + 内核可访问地址 */
-static int get_kernel_page(struct mm_struct *mm, unsigned long addr,
-                           struct page **ppage, void **kaddr)
+/* 
+ * 手动补充 kfunc_def 风格的函数指针声明。
+ * KernelPatch 加载模块时，会自动把这些指针绑定到真正的内核函数地址。
+ * 这样既不依赖头文件是否提供声明，也不会产生 unknown symbol。
+ */
+extern typeof(access_process_vm) *kf_access_process_vm;
+extern typeof(copy_from_user)    *kf_copy_from_user;
+extern typeof(copy_to_user)      *kf_copy_to_user;
+
+/* 注意：find_task_by_vpid, get_task_mm, mmput, kmalloc, kfree 等已由
+ * KernelPatch 头文件通过 kfunc_def 声明，不用再手动写。
+ */
+
+/* 读内存 */
+static long amf_read_mem(struct amf_ioctl_data __user *user_data)
 {
-    pgd_t *pgd;
-    p4d_t *p4d;
-    pud_t *pud;
-    pmd_t *pmd;
-    pte_t *pte;
-    unsigned long pfn;
-    struct page *page;
-
-    pgd = pgd_offset(mm, addr);
-    if (pgd_none(*pgd) || pgd_bad(*pgd))
-        return -EFAULT;
-
-    p4d = p4d_offset(pgd, addr);
-    if (p4d_none(*p4d) || p4d_bad(*p4d))
-        return -EFAULT;
-
-    pud = pud_offset(p4d, addr);
-    if (pud_none(*pud) || pud_bad(*pud))
-        return -EFAULT;
-
-    pmd = pmd_offset(pud, addr);
-    if (pmd_none(*pmd) || pmd_bad(*pmd))
-        return -EFAULT;
-
-    pte = pte_offset_kernel(pmd, addr);
-    if (!pte || !pte_present(*pte))
-        return -EFAULT;
-
-    pfn = pte_pfn(*pte);
-    page = pfn_to_page(pfn);
-    if (!page)
-        return -EFAULT;
-
-    *ppage = page;
-    *kaddr = page_address(page) + (addr & ~PAGE_MASK);
-    return 0;
-}
-
-/* KPM 控制入口（只用 get_user / put_user，不依赖 copy_from_user） */
-static long amf_ctl0(const char *args, char __user *out_msg, int outlen)
-{
-    unsigned int cmd;
     struct amf_ioctl_data data;
+    struct task_struct *task;
+    struct mm_struct *mm = NULL;
+    void *kbuf = NULL;
+    long ret = 0;
+    int bytes_read;
 
-    /* 使用 get_user 安全地从用户态 args 中提取参数 */
-    if (get_user(cmd, (unsigned int __user *)args))
-        return -EFAULT;
-    if (get_user(data.pid, (pid_t __user *)(args + 4)))
-        return -EFAULT;
-    if (get_user(data.addr, (unsigned long __user *)(args + 8)))
-        return -EFAULT;
-    if (get_user(data.size, (unsigned long __user *)(args + 16)))
-        return -EFAULT;
-    if (get_user(data.buffer, (void __user * __user *)(args + 24)))
+    /* 从用户态拷贝数据结构 */
+    if ((*kf_copy_from_user)(&data, user_data, sizeof(data)))
         return -EFAULT;
 
     if (data.size <= 0 || data.size > 0x100000)
         return -EINVAL;
 
-    if (cmd == AMF_IOCTL_READ_MEM) {
-        struct task_struct *task;
-        struct mm_struct *mm = NULL;
-        void *kbuf = NULL;
-        long ret = 0;
-        unsigned long offset = 0;
+    rcu_read_lock();
+    task = find_task_by_vpid(data.pid);
+    if (task)
+        mm = get_task_mm(task);
+    rcu_read_unlock();
 
-        rcu_read_lock();
-        task = find_task_by_vpid(data.pid);
-        if (task)
-            mm = get_task_mm(task);
-        rcu_read_unlock();
-        if (!mm)
-            return -ESRCH;
+    if (!mm)
+        return -ESRCH;
 
-        kbuf = kmalloc(data.size, GFP_KERNEL);
-        if (!kbuf) {
-            mmput(mm);
-            return -ENOMEM;
-        }
-
-        /* 逐页读取 */
-        for (offset = 0; offset < data.size; ) {
-            unsigned long chunk, cur_addr = data.addr + offset;
-            struct page *page;
-            void *kaddr;
-
-            chunk = PAGE_SIZE - (cur_addr & ~PAGE_MASK);
-            if (chunk > data.size - offset)
-                chunk = data.size - offset;
-
-            if (get_kernel_page(mm, cur_addr, &page, &kaddr) != 0) {
-                ret = -EFAULT;
-                break;
-            }
-            memcpy(kbuf + offset, kaddr, chunk);
-            offset += chunk;
-        }
-
-        if (ret == 0) {
-            /* 用 put_user 逐字节拷贝到用户态 out_msg（安全，但慢） */
-            unsigned long i;
-            unsigned char __user *p = (unsigned char __user *)out_msg;
-            for (i = 0; i < data.size; i++) {
-                if (put_user(((unsigned char *)kbuf)[i], p + i)) {
-                    ret = -EFAULT;
-                    break;
-                }
-            }
-            if (ret == 0)
-                ret = data.size;
-        }
-
-        kfree(kbuf);
+    kbuf = kmalloc(data.size, GFP_KERNEL);
+    if (!kbuf) {
         mmput(mm);
-        return ret;
+        return -ENOMEM;
     }
 
-    return -ENOTTY;
+    /* 关键：直接读取目标进程内存，无任何文件操作 */
+    bytes_read = (*kf_access_process_vm)(task, data.addr, kbuf, data.size,
+                                          FOLL_FORCE);
+    if (bytes_read > 0) {
+        if ((*kf_copy_to_user)(data.buffer, kbuf, bytes_read))
+            ret = -EFAULT;
+        else
+            ret = bytes_read;   // 返回实际读取的字节数
+    } else if (bytes_read == 0) {
+        ret = 0;
+    } else {
+        ret = bytes_read;
+    }
+
+    kfree(kbuf);
+    mmput(mm);
+    return ret;
+}
+
+/* 写内存 */
+static long amf_write_mem(struct amf_ioctl_data __user *user_data)
+{
+    struct amf_ioctl_data data;
+    struct task_struct *task;
+    struct mm_struct *mm = NULL;
+    void *kbuf = NULL;
+    long ret = 0;
+    int bytes_written;
+
+    if ((*kf_copy_from_user)(&data, user_data, sizeof(data)))
+        return -EFAULT;
+
+    if (data.size <= 0 || data.size > 0x100000)
+        return -EINVAL;
+
+    rcu_read_lock();
+    task = find_task_by_vpid(data.pid);
+    if (task)
+        mm = get_task_mm(task);
+    rcu_read_unlock();
+
+    if (!mm)
+        return -ESRCH;
+
+    kbuf = kmalloc(data.size, GFP_KERNEL);
+    if (!kbuf) {
+        mmput(mm);
+        return -ENOMEM;
+    }
+
+    if ((*kf_copy_from_user)(kbuf, data.buffer, data.size)) {
+        kfree(kbuf);
+        mmput(mm);
+        return -EFAULT;
+    }
+
+    bytes_written = (*kf_access_process_vm)(task, data.addr, kbuf,
+                                            data.size, FOLL_FORCE | FOLL_WRITE);
+    if (bytes_written > 0) {
+        ret = bytes_written;
+    } else if (bytes_written == 0) {
+        ret = 0;
+    } else {
+        ret = bytes_written;
+    }
+
+    kfree(kbuf);
+    mmput(mm);
+    return ret;
+}
+
+/* KPM 控制入口 */
+static long amf_ctl0(const char *args, char __user *out_msg, int outlen)
+{
+    unsigned int cmd;
+    struct amf_ioctl_data __user *user_data;
+
+    if (!args || outlen < 0)
+        return -EINVAL;
+
+    /* 从 args 中提取 cmd 和结构体 */
+    if ((*kf_copy_from_user)(&cmd, args, sizeof(cmd)))
+        return -EFAULT;
+    user_data = (struct amf_ioctl_data __user *)(args + sizeof(unsigned int));
+
+    switch (cmd) {
+    case AMF_IOCTL_READ_MEM:
+        return amf_read_mem(user_data);
+    case AMF_IOCTL_WRITE_MEM:
+        return amf_write_mem(user_data);
+    default:
+        return -ENOTTY;
+    }
 }
 
 static long my_init(const char *args, const char *event, void __user *reserved)
 {
-    printk(KERN_INFO "AndroidMemoryFantasy: loaded (page walk)\n");
+    printk(KERN_INFO "AndroidMemoryFantasy: loaded (access_process_vm)\n");
     return 0;
 }
 
