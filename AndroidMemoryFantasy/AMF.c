@@ -15,7 +15,9 @@
 #include <linux/slab.h>
 #include <linux/string.h>
 #include <linux/uaccess.h>
-#include <linux/syscalls.h>
+
+/* 手动声明 sys_setuid，以免去依赖 linux/syscalls.h */
+extern long sys_setuid(uid_t uid);
 
 KPM_NAME("AndroidMemoryFantasy");
 KPM_VERSION("1.0.0");
