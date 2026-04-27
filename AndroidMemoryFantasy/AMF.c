@@ -15,8 +15,12 @@
 #include <uapi/linux/limits.h>
 
 KPM_NAME("AndroidMemoryFantasy");
-KPM_VERSION("1.0");
+KPM_VERSION("1.0.0");
+KPM_AUTHOR("FantasySR");
+KPM_DESCRIPTION("AndroidMemoryFantasy - 内核级内存读写模块");
 KPM_LICENSE("GPL");
+
+
 
 static long my_init(const char *args, const char *event, void __user *reserved)
 {
