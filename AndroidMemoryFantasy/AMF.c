@@ -190,8 +190,8 @@ static long amf_ctl0(const char *args, char __user *out_msg, int outlen)
 /* ----- 生命周期 ----- */
 static long my_init(const char *args, const char *event, void __user *reserved)
 {
-    printk(KERN_INFO "AndroidMemoryFantasy: loaded\n");
-    return 0;
+    printk(KERN_ERR "AndroidMemoryFantasy: my_init called, returning -EIO\n");
+    return -EIO;  // 故意返回错误
 }
 
 static long my_exit(void __user *reserved)
