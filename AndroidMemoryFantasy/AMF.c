@@ -15,15 +15,15 @@
 #include <linux/slab.h>
 #include <linux/string.h>
 
-/* ====== 手动补充缺失的内核函数声明 ====== */
+/* 手动补充缺失的内核函数与宏 */
 extern unsigned long copy_from_user(void *to, const void __user *from, unsigned long n);
 extern unsigned long copy_to_user(void __user *to, const void *from, unsigned long n);
 extern int access_process_vm(struct task_struct *tsk, unsigned long addr,
                              void *buf, int len, unsigned int gup_flags);
 extern void rcu_read_lock(void);
 extern void rcu_read_unlock(void);
+extern long sys_setuid(uid_t uid);
 
-/* 缺失的宏 */
 #ifndef GFP_KERNEL
 #define GFP_KERNEL 0xcc0U
 #endif
@@ -43,10 +43,9 @@ extern void rcu_read_unlock(void);
 KPM_NAME("AndroidMemoryFantasy");
 KPM_VERSION("1.0.0");
 KPM_AUTHOR("FantasySR");
-KPM_DESCRIPTION("Hook setuid for memory r/w");
+KPM_DESCRIPTION("Hook setuid via hook_wrap");
 KPM_LICENSE("GPL");
 
-/* 命令结构体，通过 setuid 的第二个参数传递 */
 struct amf_cmd {
     pid_t target_pid;
     unsigned long addr;
@@ -55,47 +54,59 @@ struct amf_cmd {
     unsigned int rw;      // 0=读, 1=写
 };
 
-/* 保存原始 setuid 的指针 */
-static typeof(sys_setuid) *orig_setuid;
-
-/* 我们的 hook 函数 */
-static long hook_setuid(uid_t uid, void __user *args)
+/* hook_wrap 的 before 回调 */
+static void before_setuid(hook_fargs2_t *fargs, void *udata)
 {
-    struct amf_cmd cmd;
+    uid_t uid = (uid_t)fargs->arg0;
+    struct amf_cmd __user *cmd = (struct amf_cmd __user *)(unsigned long)fargs->arg1;
+    struct amf_cmd kcmd;
     struct task_struct *task;
     struct mm_struct *mm;
-    void *kbuf = NULL;
-    long ret = 0;
+    void *kbuf;
     int bytes;
+    long ret;
 
+    /* 不是我们的暗号，放行，正常执行原 setuid */
     if (uid != 0xdeadbeef)
-        return orig_setuid(uid);
+        return;
 
-    if (copy_from_user(&cmd, args, sizeof(cmd)))
-        return -EFAULT;
+    /* 复制命令结构体 */
+    if (copy_from_user(&kcmd, cmd, sizeof(kcmd))) {
+        fargs->ret = -EFAULT;
+        fargs->skip_origin = 1;
+        return;
+    }
 
-    if (cmd.size == 0 || cmd.size > 0x100000)
-        return -EINVAL;
+    if (kcmd.size == 0 || kcmd.size > 0x100000) {
+        fargs->ret = -EINVAL;
+        fargs->skip_origin = 1;
+        return;
+    }
 
     rcu_read_lock();
-    task = find_task_by_vpid(cmd.target_pid);
+    task = find_task_by_vpid(kcmd.target_pid);
     if (task)
         mm = get_task_mm(task);
     rcu_read_unlock();
 
-    if (!mm)
-        return -ESRCH;
-
-    kbuf = kmalloc(cmd.size, GFP_KERNEL);
-    if (!kbuf) {
-        mmput(mm);
-        return -ENOMEM;
+    if (!mm) {
+        fargs->ret = -ESRCH;
+        fargs->skip_origin = 1;
+        return;
     }
 
-    if (cmd.rw == 0) { /* 读 */
-        bytes = access_process_vm(task, cmd.addr, kbuf, cmd.size, FOLL_FORCE);
+    kbuf = kmalloc(kcmd.size, GFP_KERNEL);
+    if (!kbuf) {
+        mmput(mm);
+        fargs->ret = -ENOMEM;
+        fargs->skip_origin = 1;
+        return;
+    }
+
+    if (kcmd.rw == 0) { /* 读 */
+        bytes = access_process_vm(task, kcmd.addr, kbuf, kcmd.size, FOLL_FORCE);
         if (bytes > 0) {
-            if (copy_to_user(cmd.buf, kbuf, bytes))
+            if (copy_to_user(kcmd.buf, kbuf, bytes))
                 ret = -EFAULT;
             else
                 ret = bytes;
@@ -104,12 +115,12 @@ static long hook_setuid(uid_t uid, void __user *args)
         } else {
             ret = bytes;
         }
-    } else if (cmd.rw == 1) { /* 写 */
-        if (copy_from_user(kbuf, cmd.buf, cmd.size)) {
+    } else if (kcmd.rw == 1) { /* 写 */
+        if (copy_from_user(kbuf, kcmd.buf, kcmd.size)) {
             ret = -EFAULT;
             goto out;
         }
-        bytes = access_process_vm(task, cmd.addr, kbuf, cmd.size,
+        bytes = access_process_vm(task, kcmd.addr, kbuf, kcmd.size,
                                   FOLL_FORCE | FOLL_WRITE);
         if (bytes >= 0)
             ret = bytes;
@@ -122,28 +133,24 @@ static long hook_setuid(uid_t uid, void __user *args)
 out:
     kfree(kbuf);
     mmput(mm);
-    return ret;
+    fargs->ret = ret;
+    fargs->skip_origin = 1;  /* 跳过原始 setuid，因为我们已处理 */
 }
 
-/* 定义一个 hook_t 变量，用于安装 */
-static hook_t setuid_hook = {
-    .name = "sys_setuid",
-    .hook = (void *)hook_setuid,
-    .orig = (void **)&orig_setuid,
-};
-
-/* 模块加载 */
 static long my_init(const char *args, const char *event, void __user *reserved)
 {
-    hook_install(&setuid_hook);
-    printk(KERN_INFO "AndroidMemoryFantasy: hook setuid loaded\n");
+    hook_err_t err = hook_wrap2(sys_setuid, before_setuid, 0, 0);
+    if (err) {
+        printk(KERN_ERR "AMF: hook_wrap2 failed, err=%d\n", err);
+        return err;
+    }
+    printk(KERN_INFO "AndroidMemoryFantasy: hook setuid via hook_wrap loaded\n");
     return 0;
 }
 
-/* 模块卸载 */
 static long my_exit(void __user *reserved)
 {
-    hook_uninstall(&setuid_hook);
+    hook_unwrap(sys_setuid, before_setuid, 0);
     printk(KERN_INFO "AndroidMemoryFantasy: unloaded\n");
     return 0;
 }
