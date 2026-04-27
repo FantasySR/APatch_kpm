@@ -15,7 +15,29 @@
 #include <linux/slab.h>
 #include <linux/string.h>
 
-/* ====== 手动补全缺失的宏 ====== */
+/* ====== 第一步：声明原生函数原型 ====== */
+extern int access_process_vm(struct task_struct *tsk, unsigned long addr,
+                             void *buf, int len, unsigned int gup_flags);
+extern unsigned long copy_from_user(void *to, const void __user *from, unsigned long n);
+extern unsigned long copy_to_user(void __user *to, const void *from, unsigned long n);
+extern void rcu_read_lock(void);
+extern void rcu_read_unlock(void);
+
+/* ====== 第二步：声明 KernelPatch 的函数指针变量 ====== */
+extern typeof(access_process_vm) *kf_access_process_vm;
+extern typeof(copy_from_user)    *kf_copy_from_user;
+extern typeof(copy_to_user)      *kf_copy_to_user;
+extern typeof(rcu_read_lock)     *kf_rcu_read_lock;
+extern typeof(rcu_read_unlock)   *kf_rcu_read_unlock;
+
+/* ====== 第三步：定义宏，将函数调用重定向到函数指针 ====== */
+#define access_process_vm (*kf_access_process_vm)
+#define copy_from_user    (*kf_copy_from_user)
+#define copy_to_user      (*kf_copy_to_user)
+#define rcu_read_lock     (*kf_rcu_read_lock)
+#define rcu_read_unlock   (*kf_rcu_read_unlock)
+
+/* ====== 缺失的基础宏 ====== */
 #ifndef GFP_KERNEL
 #define GFP_KERNEL 0xcc0U
 #endif
@@ -28,32 +50,6 @@
 #ifndef KERN_INFO
 #define KERN_INFO "<6>"
 #endif
-
-/* ====== 对于 KernelPatch 未提供 kfunc_def 的函数，手动补充 ====== */
-
-/* access_process_vm */
-extern int access_process_vm(struct task_struct *tsk, unsigned long addr,
-                             void *buf, int len, unsigned int gup_flags);
-#define access_process_vm (*kf_access_process_vm)
-extern typeof(access_process_vm) kf_access_process_vm;
-
-/* copy_from_user */
-extern unsigned long copy_from_user(void *to, const void __user *from, unsigned long n);
-#define copy_from_user (*kf_copy_from_user)
-extern typeof(copy_from_user) kf_copy_from_user;
-
-/* copy_to_user */
-extern unsigned long copy_to_user(void __user *to, const void *from, unsigned long n);
-#define copy_to_user (*kf_copy_to_user)
-extern typeof(copy_to_user) kf_copy_to_user;
-
-/* rcu_read_lock / rcu_read_unlock */
-extern void rcu_read_lock(void);
-extern void rcu_read_unlock(void);
-#define rcu_read_lock (*kf_rcu_read_lock)
-#define rcu_read_unlock (*kf_rcu_read_unlock)
-extern typeof(rcu_read_lock) kf_rcu_read_lock;
-extern typeof(rcu_read_unlock) kf_rcu_read_unlock;
 
 /* ====== 模块信息 ====== */
 KPM_NAME("AndroidMemoryFantasy");
@@ -194,7 +190,7 @@ static long amf_ctl0(const char *args, char __user *out_msg, int outlen)
 
 static long my_init(const char *args, const char *event, void __user *reserved)
 {
-    printk(KERN_INFO "AndroidMemoryFantasy: loaded (final)\n");
+    printk(KERN_INFO "AndroidMemoryFantasy: loaded (access_process_vm)\n");
     return 0;
 }
 
