@@ -10,14 +10,11 @@
 #include <linux/errno.h>
 #include <linux/gfp.h>
 #include <linux/kernel.h>
-#include <linux/mm.h>
+#include <linux/mm.h>            /* 页表宏已经在里面了，不再需要 asm/pgtable.h */
 #include <linux/sched.h>
 #include <linux/sched/mm.h>
 #include <linux/slab.h>
-#include <linux/uaccess.h>   /* get_user, put_user */
-
-#include <asm/pgtable.h>
-#include <asm/page.h>
+#include <linux/uaccess.h>       /* get_user, put_user */
 
 KPM_NAME("AndroidMemoryFantasy");
 KPM_VERSION("1.0.0");
@@ -35,7 +32,7 @@ struct amf_ioctl_data {
     void __user *buffer;
 };
 
-/* 页表遍历辅助 */
+/* 手动翻译虚拟地址 → 物理页面 + 内核可访问地址 */
 static int get_kernel_page(struct mm_struct *mm, unsigned long addr,
                            struct page **ppage, void **kaddr)
 {
@@ -77,13 +74,13 @@ static int get_kernel_page(struct mm_struct *mm, unsigned long addr,
     return 0;
 }
 
+/* KPM 控制入口（只用 get_user / put_user，不依赖 copy_from_user） */
 static long amf_ctl0(const char *args, char __user *out_msg, int outlen)
 {
     unsigned int cmd;
     struct amf_ioctl_data data;
-    int n;
 
-    /* 使用 get_user 从 args 中安全获取命令和结构体 */
+    /* 使用 get_user 安全地从用户态 args 中提取参数 */
     if (get_user(cmd, (unsigned int __user *)args))
         return -EFAULT;
     if (get_user(data.pid, (pid_t __user *)(args + 4)))
@@ -119,17 +116,17 @@ static long amf_ctl0(const char *args, char __user *out_msg, int outlen)
             return -ENOMEM;
         }
 
+        /* 逐页读取 */
         for (offset = 0; offset < data.size; ) {
-            unsigned long chunk;
-            unsigned long addr = data.addr + offset;
+            unsigned long chunk, cur_addr = data.addr + offset;
             struct page *page;
             void *kaddr;
 
-            chunk = PAGE_SIZE - (addr & ~PAGE_MASK);
+            chunk = PAGE_SIZE - (cur_addr & ~PAGE_MASK);
             if (chunk > data.size - offset)
                 chunk = data.size - offset;
 
-            if (get_kernel_page(mm, addr, &page, &kaddr) != 0) {
+            if (get_kernel_page(mm, cur_addr, &page, &kaddr) != 0) {
                 ret = -EFAULT;
                 break;
             }
@@ -138,19 +135,7 @@ static long amf_ctl0(const char *args, char __user *out_msg, int outlen)
         }
 
         if (ret == 0) {
-            /* 用 put_user 逐字节？不行，outlen 是大小，我们可以直接用 memcpy
-             * 但要确保 out_msg 是用户空间可写的，memcpy 可能不安全。
-             * 但内核中的 memcpy 不会检查用户空间权限，我们需要 copy_to_user。
-             * 既然 copy_to_user 不可用，我们使用 put_user 循环？
-             * 对于大数据很慢。但是我们还是尝试使用 __copy_to_user 内联函数？
-             * 在 arm64 中，copy_to_user 通常是一个外联函数，但头文件有内联版本？
-             * 看 <linux/uaccess.h> 是否提供了 raw_copy_to_user 宏。
-             * 为保险，我们检查 out_msg 可写，直接用 memcpy 到 out_msg 可能会导致
-             * 内核崩溃，如果该页不可写。但在 KPM 系统调用中，out_msg 应该是由
-             * KernelPatch 保证映射好的用户态缓冲区，直接 memcpy 可能没问题。
-             * 为了绝对安全，我们使用 __put_user 内联宏，但只支持 1,2,4,8 字节。
-             * 我们不得不逐字节复制。
-             */
+            /* 用 put_user 逐字节拷贝到用户态 out_msg（安全，但慢） */
             unsigned long i;
             unsigned char __user *p = (unsigned char __user *)out_msg;
             for (i = 0; i < data.size; i++) {
@@ -168,13 +153,12 @@ static long amf_ctl0(const char *args, char __user *out_msg, int outlen)
         return ret;
     }
 
-    /* 写操作暂不支持 */
     return -ENOTTY;
 }
 
 static long my_init(const char *args, const char *event, void __user *reserved)
 {
-    printk(KERN_INFO "AndroidMemoryFantasy: loaded (final)\n");
+    printk(KERN_INFO "AndroidMemoryFantasy: loaded (page walk)\n");
     return 0;
 }
 
