@@ -10,7 +10,7 @@
 #include <linux/err.h>
 #include <linux/errno.h>
 #include <linux/fs.h>
-#include <linux/gfp.h>          // 即使内容不全，也继续包含
+#include <linux/gfp.h>
 #include <linux/kernel.h>
 #include <linux/mm.h>
 #include <linux/printk.h>
@@ -20,18 +20,37 @@
 #include <linux/slab.h>
 #include <linux/spinlock.h>
 #include <linux/string.h>
-/* 不依赖 linux/uaccess.h，因为里面可能没有声明，我们手动 extern */
+#include <linux/uaccess.h>
 
 #include <uapi/linux/limits.h>
 
-/* ----- 手动补充缺失的宏和声明 ----- */
+/* ====== 关键：定义 kf_ 前缀的外部函数 ====== */
+/* 这些函数在 KernelPatch 中都是以 kf_ 开头的别名导出的 */
+extern unsigned long kf_copy_from_user(void *to, const void __user *from, unsigned long n);
+extern unsigned long kf_copy_to_user(void __user *to, const void *from, unsigned long n);
 
-/* 若 GFP_KERNEL 未定义，则自行定义（内核常见值） */
+extern int kf_access_process_vm(struct task_struct *tsk, unsigned long addr,
+                                void *buf, int len, unsigned int gup_flags);
+
+extern struct task_struct *kf_find_task_by_vpid(pid_t nr);
+extern struct mm_struct *kf_get_task_mm(struct task_struct *task);
+extern void kf_mmput(struct mm_struct *mm);
+
+extern void kf_rcu_read_lock(void);
+extern void kf_rcu_read_unlock(void);
+
+extern void *kf_kmalloc(size_t size, gfp_t flags);
+extern void kf_kfree(const void *objp);
+
+/* printk 通常由 KernelPatch 头文件自动映射，无需手动声明 */
+/* 如果没有，就也加上：extern int kf_printk(const char *fmt, ...); */
+
+/* 若 GFP_KERNEL 未定义，自备一个（用数字常量也可以） */
 #ifndef GFP_KERNEL
-#define GFP_KERNEL (0x400U | 0x40U | 0x80U)   /* __GFP_RECLAIM | __GFP_IO | __GFP_FS */
+#define GFP_KERNEL 0xcc0U   /* 常见值 */
 #endif
 
-/* FOLL_* 宏 */
+/* FOLL 标志 */
 #ifndef FOLL_WRITE
 #define FOLL_WRITE 0x01
 #endif
@@ -39,22 +58,14 @@
 #define FOLL_FORCE 0x10
 #endif
 
-/* 手动声明用户空间拷贝函数（返回未复制的字节数，成功为0） */
-extern unsigned long copy_from_user(void *to, const void __user *from, unsigned long n);
-extern unsigned long copy_to_user(void __user *to, const void *from, unsigned long n);
-
-/* 手动声明 access_process_vm */
-extern int access_process_vm(struct task_struct *tsk, unsigned long addr,
-                             void *buf, int len, unsigned int gup_flags);
-
-/* ----- 模块元信息 ----- */
+/* ====== 模块信息 ====== */
 KPM_NAME("AndroidMemoryFantasy");
 KPM_VERSION("1.0.0");
 KPM_AUTHOR("FantasySR");
 KPM_DESCRIPTION("AndroidMemoryFantasy - 内核级内存读写模块");
 KPM_LICENSE("GPL");
 
-/* ----- IOCTL 命令与数据结构 ----- */
+/* ====== IOCTL 结构和命令 ====== */
 #define AMF_IOCTL_READ_MEM  0x01
 #define AMF_IOCTL_WRITE_MEM 0x02
 
@@ -65,7 +76,7 @@ struct amf_ioctl_data {
     void __user *buffer;
 };
 
-/* ----- 内存读取 ----- */
+/* ====== 读内存 ====== */
 static long amf_read_mem(struct amf_ioctl_data __user *user_data)
 {
     struct amf_ioctl_data data;
@@ -75,30 +86,30 @@ static long amf_read_mem(struct amf_ioctl_data __user *user_data)
     long ret = 0;
     int bytes_read;
 
-    if (copy_from_user(&data, user_data, sizeof(data)))
+    if (kf_copy_from_user(&data, user_data, sizeof(data)))
         return -EFAULT;
 
     if (data.size <= 0 || data.size > 0x100000)
         return -EINVAL;
 
-    rcu_read_lock();
-    task = find_task_by_vpid(data.pid);
+    kf_rcu_read_lock();
+    task = kf_find_task_by_vpid(data.pid);
     if (task)
-        mm = get_task_mm(task);
-    rcu_read_unlock();
+        mm = kf_get_task_mm(task);
+    kf_rcu_read_unlock();
 
     if (!mm)
         return -ESRCH;
 
-    kbuf = kmalloc(data.size, GFP_KERNEL);
+    kbuf = kf_kmalloc(data.size, GFP_KERNEL);
     if (!kbuf) {
-        mmput(mm);
+        kf_mmput(mm);
         return -ENOMEM;
     }
 
-    bytes_read = access_process_vm(task, data.addr, kbuf, data.size, FOLL_FORCE);
+    bytes_read = kf_access_process_vm(task, data.addr, kbuf, data.size, FOLL_FORCE);
     if (bytes_read > 0) {
-        if (copy_to_user(data.buffer, kbuf, bytes_read))
+        if (kf_copy_to_user(data.buffer, kbuf, bytes_read))
             ret = -EFAULT;
         else
             ret = bytes_read;
@@ -108,12 +119,12 @@ static long amf_read_mem(struct amf_ioctl_data __user *user_data)
         ret = bytes_read;
     }
 
-    kfree(kbuf);
-    mmput(mm);
+    kf_kfree(kbuf);
+    kf_mmput(mm);
     return ret;
 }
 
-/* ----- 内存写入 ----- */
+/* ====== 写内存 ====== */
 static long amf_write_mem(struct amf_ioctl_data __user *user_data)
 {
     struct amf_ioctl_data data;
@@ -123,35 +134,35 @@ static long amf_write_mem(struct amf_ioctl_data __user *user_data)
     long ret = 0;
     int bytes_written;
 
-    if (copy_from_user(&data, user_data, sizeof(data)))
+    if (kf_copy_from_user(&data, user_data, sizeof(data)))
         return -EFAULT;
 
     if (data.size <= 0 || data.size > 0x100000)
         return -EINVAL;
 
-    rcu_read_lock();
-    task = find_task_by_vpid(data.pid);
+    kf_rcu_read_lock();
+    task = kf_find_task_by_vpid(data.pid);
     if (task)
-        mm = get_task_mm(task);
-    rcu_read_unlock();
+        mm = kf_get_task_mm(task);
+    kf_rcu_read_unlock();
 
     if (!mm)
         return -ESRCH;
 
-    kbuf = kmalloc(data.size, GFP_KERNEL);
+    kbuf = kf_kmalloc(data.size, GFP_KERNEL);
     if (!kbuf) {
-        mmput(mm);
+        kf_mmput(mm);
         return -ENOMEM;
     }
 
-    if (copy_from_user(kbuf, data.buffer, data.size)) {
-        kfree(kbuf);
-        mmput(mm);
+    if (kf_copy_from_user(kbuf, data.buffer, data.size)) {
+        kf_kfree(kbuf);
+        kf_mmput(mm);
         return -EFAULT;
     }
 
-    bytes_written = access_process_vm(task, data.addr, kbuf, data.size,
-                                      FOLL_FORCE | FOLL_WRITE);
+    bytes_written = kf_access_process_vm(task, data.addr, kbuf, data.size,
+                                         FOLL_FORCE | FOLL_WRITE);
     if (bytes_written > 0) {
         ret = bytes_written;
     } else if (bytes_written == 0) {
@@ -160,12 +171,12 @@ static long amf_write_mem(struct amf_ioctl_data __user *user_data)
         ret = bytes_written;
     }
 
-    kfree(kbuf);
-    mmput(mm);
+    kf_kfree(kbuf);
+    kf_mmput(mm);
     return ret;
 }
 
-/* ----- KPM 控制入口 ----- */
+/* ====== KPM 控制入口 ====== */
 static long amf_ctl0(const char *args, char __user *out_msg, int outlen)
 {
     unsigned int cmd;
@@ -187,11 +198,11 @@ static long amf_ctl0(const char *args, char __user *out_msg, int outlen)
     }
 }
 
-/* ----- 生命周期 ----- */
+/* ====== 生命周期 ====== */
 static long my_init(const char *args, const char *event, void __user *reserved)
 {
-    printk(KERN_ERR "AndroidMemoryFantasy: my_init called, returning -EIO\n");
-    return -EIO;  // 故意返回错误
+    printk(KERN_INFO "AndroidMemoryFantasy: loaded\n");
+    return 0;
 }
 
 static long my_exit(void __user *reserved)
