@@ -8,17 +8,58 @@
 
 #include <linux/err.h>
 #include <linux/errno.h>
-#include <linux/gfp.h>
 #include <linux/kernel.h>
 #include <linux/mm.h>
 #include <linux/sched.h>
 #include <linux/sched/mm.h>
 #include <linux/slab.h>
+#include <linux/string.h>
 
+/* ====== 手动补全缺失的宏 ====== */
+#ifndef GFP_KERNEL
+#define GFP_KERNEL 0xcc0U
+#endif
+#ifndef FOLL_FORCE
+#define FOLL_FORCE 0x10
+#endif
+#ifndef FOLL_WRITE
+#define FOLL_WRITE 0x01
+#endif
+#ifndef KERN_INFO
+#define KERN_INFO "<6>"
+#endif
+
+/* ====== 对于 KernelPatch 未提供 kfunc_def 的函数，手动补充 ====== */
+
+/* access_process_vm */
+extern int access_process_vm(struct task_struct *tsk, unsigned long addr,
+                             void *buf, int len, unsigned int gup_flags);
+#define access_process_vm (*kf_access_process_vm)
+extern typeof(access_process_vm) kf_access_process_vm;
+
+/* copy_from_user */
+extern unsigned long copy_from_user(void *to, const void __user *from, unsigned long n);
+#define copy_from_user (*kf_copy_from_user)
+extern typeof(copy_from_user) kf_copy_from_user;
+
+/* copy_to_user */
+extern unsigned long copy_to_user(void __user *to, const void *from, unsigned long n);
+#define copy_to_user (*kf_copy_to_user)
+extern typeof(copy_to_user) kf_copy_to_user;
+
+/* rcu_read_lock / rcu_read_unlock */
+extern void rcu_read_lock(void);
+extern void rcu_read_unlock(void);
+#define rcu_read_lock (*kf_rcu_read_lock)
+#define rcu_read_unlock (*kf_rcu_read_unlock)
+extern typeof(rcu_read_lock) kf_rcu_read_lock;
+extern typeof(rcu_read_unlock) kf_rcu_read_unlock;
+
+/* ====== 模块信息 ====== */
 KPM_NAME("AndroidMemoryFantasy");
 KPM_VERSION("1.0.0");
 KPM_AUTHOR("FantasySR");
-KPM_DESCRIPTION("AndroidMemoryFantasy - kernel rw via access_process_vm");
+KPM_DESCRIPTION("AndroidMemoryFantasy - kernel rw");
 KPM_LICENSE("GPL");
 
 #define AMF_IOCTL_READ_MEM  0x01
@@ -31,20 +72,6 @@ struct amf_ioctl_data {
     void __user *buffer;
 };
 
-/* 
- * 手动补充 kfunc_def 风格的函数指针声明。
- * KernelPatch 加载模块时，会自动把这些指针绑定到真正的内核函数地址。
- * 这样既不依赖头文件是否提供声明，也不会产生 unknown symbol。
- */
-extern typeof(access_process_vm) *kf_access_process_vm;
-extern typeof(copy_from_user)    *kf_copy_from_user;
-extern typeof(copy_to_user)      *kf_copy_to_user;
-
-/* 注意：find_task_by_vpid, get_task_mm, mmput, kmalloc, kfree 等已由
- * KernelPatch 头文件通过 kfunc_def 声明，不用再手动写。
- */
-
-/* 读内存 */
 static long amf_read_mem(struct amf_ioctl_data __user *user_data)
 {
     struct amf_ioctl_data data;
@@ -54,8 +81,7 @@ static long amf_read_mem(struct amf_ioctl_data __user *user_data)
     long ret = 0;
     int bytes_read;
 
-    /* 从用户态拷贝数据结构 */
-    if ((*kf_copy_from_user)(&data, user_data, sizeof(data)))
+    if (copy_from_user(&data, user_data, sizeof(data)))
         return -EFAULT;
 
     if (data.size <= 0 || data.size > 0x100000)
@@ -76,14 +102,12 @@ static long amf_read_mem(struct amf_ioctl_data __user *user_data)
         return -ENOMEM;
     }
 
-    /* 关键：直接读取目标进程内存，无任何文件操作 */
-    bytes_read = (*kf_access_process_vm)(task, data.addr, kbuf, data.size,
-                                          FOLL_FORCE);
+    bytes_read = access_process_vm(task, data.addr, kbuf, data.size, FOLL_FORCE);
     if (bytes_read > 0) {
-        if ((*kf_copy_to_user)(data.buffer, kbuf, bytes_read))
+        if (copy_to_user(data.buffer, kbuf, bytes_read))
             ret = -EFAULT;
         else
-            ret = bytes_read;   // 返回实际读取的字节数
+            ret = bytes_read;
     } else if (bytes_read == 0) {
         ret = 0;
     } else {
@@ -95,7 +119,6 @@ static long amf_read_mem(struct amf_ioctl_data __user *user_data)
     return ret;
 }
 
-/* 写内存 */
 static long amf_write_mem(struct amf_ioctl_data __user *user_data)
 {
     struct amf_ioctl_data data;
@@ -105,7 +128,7 @@ static long amf_write_mem(struct amf_ioctl_data __user *user_data)
     long ret = 0;
     int bytes_written;
 
-    if ((*kf_copy_from_user)(&data, user_data, sizeof(data)))
+    if (copy_from_user(&data, user_data, sizeof(data)))
         return -EFAULT;
 
     if (data.size <= 0 || data.size > 0x100000)
@@ -126,14 +149,14 @@ static long amf_write_mem(struct amf_ioctl_data __user *user_data)
         return -ENOMEM;
     }
 
-    if ((*kf_copy_from_user)(kbuf, data.buffer, data.size)) {
+    if (copy_from_user(kbuf, data.buffer, data.size)) {
         kfree(kbuf);
         mmput(mm);
         return -EFAULT;
     }
 
-    bytes_written = (*kf_access_process_vm)(task, data.addr, kbuf,
-                                            data.size, FOLL_FORCE | FOLL_WRITE);
+    bytes_written = access_process_vm(task, data.addr, kbuf, data.size,
+                                      FOLL_FORCE | FOLL_WRITE);
     if (bytes_written > 0) {
         ret = bytes_written;
     } else if (bytes_written == 0) {
@@ -147,7 +170,6 @@ static long amf_write_mem(struct amf_ioctl_data __user *user_data)
     return ret;
 }
 
-/* KPM 控制入口 */
 static long amf_ctl0(const char *args, char __user *out_msg, int outlen)
 {
     unsigned int cmd;
@@ -156,8 +178,7 @@ static long amf_ctl0(const char *args, char __user *out_msg, int outlen)
     if (!args || outlen < 0)
         return -EINVAL;
 
-    /* 从 args 中提取 cmd 和结构体 */
-    if ((*kf_copy_from_user)(&cmd, args, sizeof(cmd)))
+    if (copy_from_user(&cmd, args, sizeof(cmd)))
         return -EFAULT;
     user_data = (struct amf_ioctl_data __user *)(args + sizeof(unsigned int));
 
@@ -173,7 +194,7 @@ static long amf_ctl0(const char *args, char __user *out_msg, int outlen)
 
 static long my_init(const char *args, const char *event, void __user *reserved)
 {
-    printk(KERN_INFO "AndroidMemoryFantasy: loaded (access_process_vm)\n");
+    printk(KERN_INFO "AndroidMemoryFantasy: loaded (final)\n");
     return 0;
 }
 
